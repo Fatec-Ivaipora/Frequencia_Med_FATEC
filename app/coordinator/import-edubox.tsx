@@ -6,6 +6,8 @@ import { ActivityIndicator, Platform, StyleSheet, Text, View } from "react-nativ
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { getRollcall } from "../../src/components/services/rollcalls";
+import { getTurma } from "../../src/components/services/turmas";
+import { normalizeRa } from "../../src/components/utils/alunosImport";
 import { Button } from "../../src/components/ui/Button";
 import { EmptyState } from "../../src/components/ui/EmptyState";
 import { notify } from "../../src/components/ui/feedback";
@@ -103,7 +105,7 @@ async function postToEdubox(url: string, bodyText: string) {
 }
 
 export default function ImportEdubox() {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const { id, turmaId } = useLocalSearchParams<{ id: string; turmaId?: string }>();
   const [permission, requestPermission] = useCameraPermissions();
   const [locked, setLocked] = useState(false);
   const [sending, setSending] = useState(false);
@@ -116,8 +118,27 @@ export default function ImportEdubox() {
       setSending(true);
 
       const url = parseEduboxQrToUrl(String(data || ""));
-      const rollcall: any = await getRollcall(String(id));
-      const bodyText = makeBodyRADateBR(rollcall.ras || [], rollcall.date, rollcall.shift);
+
+      const ids = String(id || "").split(",").filter(Boolean);
+      const rollcalls = (await Promise.all(ids.map((rid) => getRollcall(rid)))).filter(
+        Boolean
+      ) as any[];
+      if (!rollcalls.length) throw new Error("Chamada não encontrada.");
+
+      // Junta os RAs de todos os grupos (sem duplicar) num único envio.
+      let mergedRas = Array.from(
+        new Set(rollcalls.flatMap((r) => (r.ras || []).map(normalizeRa)))
+      ).filter(Boolean);
+
+      // Vindo da tela da turma: envia só os alunos daquela turma.
+      if (turmaId) {
+        const turma: any = await getTurma(String(turmaId));
+        if (!turma) throw new Error("Turma não encontrada.");
+        const doTurma = new Set((turma.alunos || []).map((a: any) => normalizeRa(a.ra)));
+        mergedRas = mergedRas.filter((ra) => doTurma.has(ra));
+        if (!mergedRas.length) throw new Error("Nenhum aluno desta turma nas chamadas.");
+      }
+      const bodyText = makeBodyRADateBR(mergedRas, rollcalls[0].date, rollcalls[0].shift);
 
       await postToEdubox(url, bodyText);
 

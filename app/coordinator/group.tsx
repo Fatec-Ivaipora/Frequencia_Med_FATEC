@@ -54,6 +54,20 @@ export default function RollcallGroup() {
 
   const first = items[0];
 
+  // Quando há mais de uma chamada (grupo) para a mesma aula, oferece um
+  // envio único que junta os RAs de todos os grupos daquela aula.
+  const shiftGroups = useMemo(() => {
+    const map = new Map<string, any[]>();
+    for (const it of items) {
+      const key = String(it.shift || "");
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(it);
+    }
+    return Array.from(map.entries())
+      .filter(([, its]) => its.length > 1)
+      .map(([shift, its]) => ({ shift, items: its }));
+  }, [items]);
+
   if (loading) {
     return (
       <ScreenContainer scrollable={false}>
@@ -100,6 +114,30 @@ export default function RollcallGroup() {
             </Text>
           </View>
         </View>
+
+        {/* Envio único quando há mais de um grupo na mesma aula */}
+        {shiftGroups.map((sg) => {
+          const totalAlunos = new Set(sg.items.flatMap((it) => it.ras || [])).size;
+          return (
+            <View key={sg.shift} style={styles.mergeCard}>
+              <Text style={styles.mergeTitle}>
+                {shiftLabel(sg.shift)} · {sg.items.length} grupos · {totalAlunos} aluno
+                {totalAlunos === 1 ? "" : "s"} no total
+              </Text>
+              <Button
+                title="Enviar tudo para o Edubox"
+                icon="qr-code-outline"
+                onPress={() =>
+                  router.push({
+                    pathname: "/coordinator/import-edubox",
+                    params: { id: sg.items.map((it: any) => it.id).join(",") },
+                  })
+                }
+                style={styles.mergeButton}
+              />
+            </View>
+          );
+        })}
 
         {/* Painéis das aulas, lado a lado no desktop */}
         <View style={[styles.panels, isWide && styles.panelsWide]}>
@@ -170,6 +208,24 @@ const styles = StyleSheet.create({
   meta: {
     ...type.meta,
     fontSize: 14,
+  },
+
+  mergeCard: {
+    marginTop: spacing.lg,
+    backgroundColor: colors.primaryTint,
+    borderWidth: 1,
+    borderColor: colors.primary,
+    borderRadius: radius.lg,
+    padding: spacing.lg,
+  },
+  mergeTitle: {
+    ...type.meta,
+    fontWeight: "600",
+    color: colors.primary,
+    marginBottom: spacing.sm,
+  },
+  mergeButton: {
+    alignSelf: "stretch",
   },
 
   panels: {

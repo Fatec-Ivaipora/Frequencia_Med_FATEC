@@ -1,0 +1,53 @@
+rules_version = '2';
+
+// Regras do Firestore do app Frequência Medicina.
+// Coordenador: lê e altera tudo. Preceptor: lê as UBS e cria chamadas.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Mesmo critério do app (app/index.tsx): UID fixo do coordenador ou role no perfil.
+    function isCoordinator() {
+      return signedIn() && (
+        request.auth.uid == "ZQGqgnsXQTWrPqxUlseq6bqjoiw2" ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          profile().get("role", "") in ["coordinator", "admin"])
+      );
+    }
+
+    // Perfis (role/active). Cada um lê o seu; só o coordenador cria/altera.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isCoordinator());
+      allow write: if isCoordinator();
+    }
+
+    // Cadastro de preceptores: só o coordenador.
+    match /preceptors/{id} {
+      allow read, write: if isCoordinator();
+    }
+
+    // UBS/hospitais: o preceptor precisa ler para escolher o local da chamada.
+    match /ubss/{id} {
+      allow read: if signedIn();
+      allow write: if isCoordinator();
+    }
+
+    // Chamadas: o preceptor cria (em nome dele); coordenador vê, edita e exclui.
+    match /rollcalls/{id} {
+      allow create: if signedIn() && request.resource.data.createdBy == request.auth.uid;
+      allow read, update, delete: if isCoordinator();
+    }
+
+    // Turmas (nome + alunos RA/nome): só o coordenador.
+    match /turmas/{id} {
+      allow read, write: if isCoordinator();
+    }
+  }
+}

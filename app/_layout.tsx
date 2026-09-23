@@ -24,6 +24,7 @@ export default function RootLayout() {
         <Stack.Screen name="coordinator/list" options={{ title: "Chamadas" }} />
         <Stack.Screen name="coordinator/[id]" options={{ title: "Detalhes da chamada" }} />
         <Stack.Screen name="coordinator/group" options={{ title: "Chamadas do dia" }} />
+        <Stack.Screen name="coordinator/turma" options={{ title: "Chamadas da turma" }} />
         <Stack.Screen name="coordinator/import-edubox" options={{ title: "Enviar para o Edubox" }} />
         <Stack.Screen name="admin" options={{ title: "Administração" }} />
       </Stack>

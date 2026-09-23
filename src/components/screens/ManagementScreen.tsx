@@ -1,8 +1,10 @@
 import { Ionicons } from "@expo/vector-icons";
+import { Picker } from "@react-native-picker/picker";
 import { Stack, router } from "expo-router";
 import React, { useEffect, useMemo, useState } from "react";
 import {
     FlatList,
+    Platform,
     Pressable,
     RefreshControl,
     ScrollView,
@@ -15,6 +17,7 @@ import {
 import { logout } from "../services/auth";
 import { createPreceptor, deletePreceptor, listPreceptors } from "../services/preceptor";
 import { listRollcalls } from "../services/rollcalls";
+import { createTurma, listTurmas } from "../services/turmas";
 import { createUBS, deleteUBS, listUBS } from "../services/ubs";
 import { HeaderBrand, HeaderLogout } from "../ui/AppHeader";
 import { AppModal } from "../ui/AppModal";
@@ -28,6 +31,8 @@ import { ScreenContainer } from "../ui/ScreenContainer";
 import { Skeleton } from "../ui/Skeleton";
 import { confirmAction, notify } from "../ui/feedback";
 import { colors, radius, shadow, spacing, type } from "../ui/theme";
+import { normalizeRa, parseAlunos, pickTextFileWeb } from "../utils/alunosImport";
+import { dayName, longDate, todayLong } from "../utils/dates";
 import { formatDateBR, normalizeSearch, shiftLabel, todayISO } from "../utils/format";
 
 interface ManagementScreenProps {
@@ -42,6 +47,9 @@ const PERIODS: { key: Period; label: string }[] = [
     { key: "all", label: "Todas" },
 ];
 
+// Identifica a UBS/hospital da chamada (mesma chave usada no agrupamento dos cards).
+const ubsKeyOf = (r: any) => normalizeSearch(r.ubsSlug || r.ubsName || "");
+
 /** Tela de gestão usada pelo coordenador (/coordinator/list) e pelo admin (/admin). */
 export function ManagementScreen({ title }: ManagementScreenProps) {
     const { width } = useWindowDimensions();
@@ -53,12 +61,32 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
 
     const [query, setQuery] = useState("");
     const [period, setPeriod] = useState<Period>("today");
+    const [ubsFilter, setUbsFilter] = useState(""); // "" = todos os locais
 
-    // Busca ignora o período (procura no histórico todo); sem busca, vale o filtro.
+    // Locais (UBS/hospitais) que têm chamadas, para o filtro por local.
+    const ubsOptions = useMemo(() => {
+        const map = new Map<string, string>();
+        for (const r of rollcalls) {
+            const key = ubsKeyOf(r);
+            if (key && !map.has(key)) map.set(key, String(r.ubsName || key));
+        }
+        return Array.from(map, ([key, name]) => ({ key, name })).sort((a, b) =>
+            a.name.localeCompare(b.name)
+        );
+    }, [rollcalls]);
+
+    // Se o local selecionado sumiu (ex.: após atualizar), volta para "todos".
+    useEffect(() => {
+        if (ubsFilter && !ubsOptions.some((o) => o.key === ubsFilter)) setUbsFilter("");
+    }, [ubsOptions, ubsFilter]);
+
+    // Filtro de local vale sempre. Busca ignora o período (procura no histórico todo);
+    // sem busca, vale o filtro de período.
     const filteredRollcalls = useMemo(() => {
+        const base = ubsFilter ? rollcalls.filter((r) => ubsKeyOf(r) === ubsFilter) : rollcalls;
         const q = normalizeSearch(query.trim());
         if (q) {
-            return rollcalls.filter(
+            return base.filter(
                 (r) =>
                     normalizeSearch(r.ubsName).includes(q) ||
                     formatDateBR(r.date).includes(q) ||
@@ -68,7 +96,7 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
         }
         if (period === "today") {
             const today = todayISO();
-            return rollcalls.filter((r) => String(r.date) === today);
+            return base.filter((r) => String(r.date) === today);
         }
         if (period === "week") {
             const limit = new Date();
@@ -77,10 +105,10 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
             const mm = String(limit.getMonth() + 1).padStart(2, "0");
             const dd = String(limit.getDate()).padStart(2, "0");
             const limitISO = `${yyyy}-${mm}-${dd}`;
-            return rollcalls.filter((r) => String(r.date) >= limitISO);
+            return base.filter((r) => String(r.date) >= limitISO);
         }
-        return rollcalls;
-    }, [rollcalls, query, period]);
+        return base;
+    }, [rollcalls, query, period, ubsFilter]);
 
     // Agrupa chamadas da mesma UBS, mesmo dia e mesmo turno (1ª e 2ª aula juntas).
     // Turnos diferentes (manhã/tarde) geram cards separados.
@@ -98,7 +126,7 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
         const map = new Map<string, any>();
         for (const r of filteredRollcalls) {
             const turno = turnoOf(r);
-            const key = `${normalizeSearch(r.ubsSlug || r.ubsName || "")}|${r.date}|${turno}`;
+            const key = `${ubsKeyOf(r)}|${r.date}|${turno}`;
             if (!map.has(key)) {
                 map.set(key, { key, ubsName: r.ubsName, date: r.date, turno, items: [] });
             }
@@ -118,6 +146,23 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
         return groups;
     }, [filteredRollcalls]);
 
+    // Seções por dia (a lista já vem do mais recente pro mais antigo), com totais do dia.
+    const daySections = useMemo(() => {
+        const map = new Map<string, any[]>();
+        for (const g of groupedRollcalls) {
+            const d = String(g.date || "");
+            if (!map.has(d)) map.set(d, []);
+            map.get(d)!.push(g);
+        }
+        return Array.from(map, ([date, groups]) => ({
+            date,
+            groups,
+            students: new Set(
+                groups.flatMap((g: any) => g.items.flatMap((it: any) => it.ras || []))
+            ).size,
+        }));
+    }, [groupedRollcalls]);
+
     const [ubsList, setUbsList] = useState<any[]>([]);
     const [ubsModal, setUbsModal] = useState(false);
     const [ubsName, setUbsName] = useState("");
@@ -133,6 +178,42 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
     const [precError, setPrecError] = useState<string | null>(null);
     const [precSaving, setPrecSaving] = useState(false);
     const [precQuery, setPrecQuery] = useState("");
+
+    const [turmas, setTurmas] = useState<any[]>([]);
+    const [turmaModal, setTurmaModal] = useState(false);
+    const [turmaName, setTurmaName] = useState("");
+    const [turmaText, setTurmaText] = useState("");
+    const [turmaError, setTurmaError] = useState<string | null>(null);
+    const [turmaSaving, setTurmaSaving] = useState(false);
+    const turmaPreview = useMemo(() => parseAlunos(turmaText), [turmaText]);
+
+    const [tab, setTab] = useState<"chamadas" | "turmas">("chamadas");
+
+    // Resumo de cada turma: última chamada com alunos dela e quantos estavam presentes.
+    const turmaSummaries = useMemo(
+        () =>
+            turmas.map((t) => {
+                const ras = new Set((t.alunos || []).map((a: any) => normalizeRa(a.ra)));
+                const presentByDate = new Map<string, Set<string>>();
+                for (const r of rollcalls) {
+                    for (const ra of r.ras || []) {
+                        const n = normalizeRa(ra);
+                        if (!ras.has(n)) continue;
+                        const d = String(r.date || "");
+                        if (!presentByDate.has(d)) presentByDate.set(d, new Set());
+                        presentByDate.get(d)!.add(n);
+                    }
+                }
+                const lastDate = Array.from(presentByDate.keys()).sort().pop() || "";
+                return {
+                    ...t,
+                    total: ras.size,
+                    lastDate,
+                    lastPresent: lastDate ? presentByDate.get(lastDate)!.size : 0,
+                };
+            }),
+        [turmas, rollcalls]
+    );
 
     const filteredUbs = useMemo(() => {
         const q = normalizeSearch(ubsQuery.trim());
@@ -152,10 +233,16 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
         if (asRefresh) setRefreshing(true);
         else setLoading(true);
         try {
-            const [calls, u, p] = await Promise.all([listRollcalls(), listUBS(), listPreceptors()]);
+            const [calls, u, p, t] = await Promise.all([
+                listRollcalls(),
+                listUBS(),
+                listPreceptors(),
+                listTurmas(),
+            ]);
             setRollcalls(calls);
             setUbsList(u);
             setPreceptors(p);
+            setTurmas(t);
         } catch (e: any) {
             notify("error", e?.message || "Falha ao carregar os dados.");
         } finally {
@@ -208,6 +295,49 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
         } catch (e: any) {
             notify("error", e?.message || "Falha ao excluir a UBS.");
         }
+    }
+
+    async function handlePickAlunosFile() {
+        const text = await pickTextFileWeb();
+        if (text != null) {
+            setTurmaText(text);
+            if (turmaError) setTurmaError(null);
+        }
+    }
+
+    async function handleCreateTurma() {
+        const name = turmaName.trim();
+        if (!name) {
+            setTurmaError("Informe o nome da turma.");
+            return;
+        }
+        if (turmas.some((t) => normalizeSearch(t.name) === normalizeSearch(name))) {
+            setTurmaError(`Já existe uma turma "${name}".`);
+            return;
+        }
+        if (!turmaPreview.alunos.length) {
+            setTurmaError("Cole ou importe a lista de alunos (RA e nome).");
+            return;
+        }
+        try {
+            setTurmaSaving(true);
+            await createTurma({ name, alunos: turmaPreview.alunos });
+            setTurmaName("");
+            setTurmaText("");
+            setTurmaError(null);
+            notify("success", `Turma ${name} cadastrada com ${turmaPreview.alunos.length} alunos.`);
+            setTurmaModal(false);
+            setTab("turmas");
+            await loadAll();
+        } catch (e: any) {
+            notify("error", e?.message || "Falha ao cadastrar a turma.");
+        } finally {
+            setTurmaSaving(false);
+        }
+    }
+
+    function openTurma(id: string) {
+        router.push({ pathname: "/coordinator/turma", params: { turmaId: id } });
     }
 
     async function handleCreatePreceptor() {
@@ -268,166 +398,429 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
             />
 
             <View style={[styles.container, isWide && styles.containerWide]}>
-                <View style={styles.actions}>
-                    <Button
-                        title="Cadastrar UBS"
-                        icon="business-outline"
-                        variant="secondary"
-                        small
-                        onPress={() => {
-                            setUbsQuery("");
-                            setUbsModal(true);
-                        }}
-                    />
-                    <Button
-                        title="Cadastrar preceptor"
-                        icon="person-add-outline"
-                        variant="secondary"
-                        small
-                        onPress={() => {
-                            setPrecQuery("");
-                            setPrecModal(true);
-                        }}
-                    />
-                    <Button
-                        title="Atualizar"
-                        icon="refresh-outline"
-                        variant="plain"
-                        small
-                        loading={loading && !refreshing}
-                        onPress={() => loadAll()}
-                    />
+                {/* Cabeçalho: data de hoje, abas (que fazem o papel de título) e cadastros */}
+                <View style={styles.pageHeader}>
+                    <View style={styles.pageHeaderMain}>
+                        <Text style={styles.todayText}>{todayLong()}</Text>
+                        <View style={styles.tabs} accessibilityRole="tablist">
+                            {(
+                                [
+                                    { key: "chamadas", label: "Chamadas" },
+                                    { key: "turmas", label: "Turmas" },
+                                ] as const
+                            ).map((t) => {
+                                const active = tab === t.key;
+                                return (
+                                    <Pressable
+                                        key={t.key}
+                                        accessibilityRole="tab"
+                                        accessibilityState={{ selected: active }}
+                                        onPress={() => setTab(t.key)}
+                                        style={({ pressed }) => [
+                                            styles.tab,
+                                            active && styles.tabActive,
+                                            pressed && !active && styles.tabPressed,
+                                        ]}
+                                    >
+                                        <Text style={[styles.tabText, active && styles.tabTextActive]}>
+                                            {t.label}
+                                        </Text>
+                                        {t.key === "turmas" && turmas.length > 0 ? (
+                                            <Text style={[styles.tabCount, active && styles.tabCountActive]}>
+                                                {turmas.length}
+                                            </Text>
+                                        ) : null}
+                                    </Pressable>
+                                );
+                            })}
+                        </View>
+                    </View>
+
+                    <View style={styles.topActions}>
+                        <Button
+                            title="UBS"
+                            icon="business-outline"
+                            variant="plain"
+                            small
+                            onPress={() => {
+                                setUbsQuery("");
+                                setUbsModal(true);
+                            }}
+                        />
+                        <Button
+                            title="Preceptores"
+                            icon="person-outline"
+                            variant="plain"
+                            small
+                            onPress={() => {
+                                setPrecQuery("");
+                                setPrecModal(true);
+                            }}
+                        />
+                        <IconButton
+                            icon="refresh-outline"
+                            label="Atualizar"
+                            color={colors.primary}
+                            onPress={() => loadAll()}
+                        />
+                    </View>
                 </View>
 
-                <Text style={styles.sectionTitle}>Chamadas recebidas</Text>
-
-                {/* Barra de pesquisa */}
-                <SearchBox
-                    value={query}
-                    onChangeText={setQuery}
-                    placeholder="Buscar por UBS, data ou turno..."
-                    style={styles.search}
-                />
-
-                {/* Filtro de período (some durante a busca, que vale para o histórico todo) */}
-                {query.trim().length === 0 ? (
-                    <View style={styles.filterRow}>
-                        {PERIODS.map((p) => {
-                            const active = period === p.key;
-                            return (
-                                <Pressable
-                                    key={p.key}
-                                    accessibilityRole="button"
-                                    accessibilityState={{ selected: active }}
-                                    onPress={() => setPeriod(p.key)}
-                                    style={({ pressed }) => [
-                                        styles.chip,
-                                        active && styles.chipActive,
-                                        pressed && !active && styles.chipPressed,
-                                    ]}
-                                >
-                                    <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                                        {p.label}
-                                    </Text>
-                                </Pressable>
-                            );
-                        })}
-                    </View>
-                ) : (
-                    <Text style={styles.resultCount}>
-                        {filteredRollcalls.length}{" "}
-                        {filteredRollcalls.length === 1 ? "resultado" : "resultados"} no histórico
-                    </Text>
-                )}
-
-                {loading ? (
-                    <View style={styles.skeletons}>
-                        {[0, 1, 2].map((i) => (
-                            <View key={i} style={styles.skeletonCard}>
-                                <Skeleton height={16} width="45%" />
-                                <Skeleton height={12} width="65%" style={{ marginTop: spacing.sm }} />
-                            </View>
-                        ))}
-                    </View>
-                ) : (
+                {tab === "turmas" ? (
                     <FlatList
-                        data={groupedRollcalls}
-                        keyExtractor={(g) => g.key}
+                        key={isWide ? "turmas-grid" : "turmas-list"}
+                        data={loading ? [] : turmaSummaries}
+                        keyExtractor={(t) => t.id}
+                        numColumns={isWide ? 3 : 1}
+                        columnWrapperStyle={isWide ? styles.turmaGridRow : undefined}
                         contentContainerStyle={styles.listContent}
                         refreshControl={
                             <RefreshControl refreshing={refreshing} onRefresh={() => loadAll(true)} />
                         }
-                        renderItem={({ item: group }) => (
-                            <Pressable
-                                accessibilityRole="button"
-                                accessibilityLabel={`Abrir chamadas de ${group.ubsName} em ${formatDateBR(group.date)}`}
-                                onPress={() =>
-                                    group.items.length === 1
-                                        ? router.push(`/coordinator/${group.items[0].id}`)
-                                        : router.push({
-                                              pathname: "/coordinator/group",
-                                              params: {
-                                                  ids: group.items.map((i: any) => i.id).join(","),
-                                              },
-                                          })
-                                }
-                                style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
-                            >
-                                <View style={styles.cardBody}>
-                                    {group.turno ? (
-                                        <TurnoTag turno={group.turno} style={styles.turnoTag} />
-                                    ) : null}
-                                    <Text style={styles.cardTitle}>{group.ubsName}</Text>
-                                    <View style={styles.cardMetaRow}>
-                                        <Ionicons name="calendar-outline" size={14} color={colors.muted} />
-                                        <Text style={styles.cardMeta}>{formatDateBR(group.date)}</Text>
-                                        {group.items.map((it: any) => (
-                                            <View key={it.id} style={styles.badge}>
-                                                <Text style={styles.badgeText}>
-                                                    {shiftLabel(it.shift)} · {(it.ras || []).length} RA
-                                                    {(it.ras || []).length === 1 ? "" : "s"}
+                        ListHeaderComponent={
+                            <View style={styles.turmasIntro}>
+                                <Text style={styles.hint}>
+                                    Cada turma reúne as chamadas de todos os seus grupos, em qualquer UBS
+                                    ou hospital. Abra uma turma para lançar a presença de todos de uma vez.
+                                </Text>
+                                <Button
+                                    title="Nova turma"
+                                    icon="add"
+                                    small
+                                    onPress={() => setTurmaModal(true)}
+                                />
+                            </View>
+                        }
+                        renderItem={({ item: t }) => {
+                            const pct = t.total ? Math.round((t.lastPresent / t.total) * 100) : 0;
+                            return (
+                                <Pressable
+                                    accessibilityRole="button"
+                                    accessibilityLabel={`Abrir turma ${t.name}`}
+                                    onPress={() => openTurma(t.id)}
+                                    style={({ pressed }) => [
+                                        styles.turmaCard,
+                                        isWide && styles.turmaCardWide,
+                                        pressed && styles.callPressed,
+                                    ]}
+                                >
+                                    <View style={styles.turmaTop}>
+                                        <Text style={styles.turmaName} numberOfLines={1}>
+                                            {t.name}
+                                        </Text>
+                                        <Ionicons name="chevron-forward" size={18} color={colors.muted} />
+                                    </View>
+                                    <Text style={styles.turmaStudents}>
+                                        {t.total} aluno{t.total === 1 ? "" : "s"}
+                                    </Text>
+
+                                    {t.lastDate ? (
+                                        <View style={styles.turmaLast}>
+                                            <View style={styles.turmaLastRow}>
+                                                <Text style={styles.turmaLastLabel}>
+                                                    Última chamada:{" "}
+                                                    {t.lastDate === todayISO()
+                                                        ? "hoje"
+                                                        : formatDateBR(t.lastDate)}
+                                                </Text>
+                                                <Text style={styles.turmaLastValue}>
+                                                    {t.lastPresent}/{t.total}
                                                 </Text>
                                             </View>
-                                        ))}
-                                    </View>
-                                </View>
-                                <Ionicons name="chevron-forward" size={18} color={colors.muted} />
-                            </Pressable>
-                        )}
+                                            <View
+                                                style={styles.progressTrack}
+                                                accessibilityLabel={`${t.lastPresent} de ${t.total} presentes`}
+                                            >
+                                                <View style={[styles.progressFill, { width: `${pct}%` }]} />
+                                            </View>
+                                        </View>
+                                    ) : (
+                                        <Text style={styles.turmaNone}>Nenhuma chamada ainda</Text>
+                                    )}
+                                </Pressable>
+                            );
+                        }}
                         ListEmptyComponent={
-                            query.trim().length > 0 ? (
-                                <EmptyState
-                                    icon="search-outline"
-                                    title="Nada encontrado"
-                                    description={`Nenhuma chamada corresponde a "${query.trim()}".`}
-                                />
-                            ) : period !== "all" ? (
-                                <EmptyState
-                                    icon="today-outline"
-                                    title={
-                                        period === "today"
-                                            ? "Nenhuma chamada hoje"
-                                            : "Nenhuma chamada nos últimos 7 dias"
-                                    }
-                                    description="As chamadas aparecem aqui assim que os preceptores salvarem."
-                                >
-                                    <Button
-                                        title="Ver todas as chamadas"
-                                        variant="secondary"
-                                        small
-                                        onPress={() => setPeriod("all")}
-                                    />
-                                </EmptyState>
+                            loading ? (
+                                <View style={styles.skeletons}>
+                                    {[0, 1].map((i) => (
+                                        <View key={i} style={styles.skeletonCard}>
+                                            <Skeleton height={20} width="20%" />
+                                            <Skeleton height={12} width="50%" style={{ marginTop: spacing.sm }} />
+                                        </View>
+                                    ))}
+                                </View>
                             ) : (
                                 <EmptyState
-                                    icon="clipboard-outline"
-                                    title="Nenhuma chamada recebida"
-                                    description="As chamadas salvas pelos preceptores aparecem aqui."
-                                />
+                                    icon="people-outline"
+                                    title="Nenhuma turma cadastrada"
+                                    description="Cadastre a turma (ex.: T1) com o RA e o nome dos alunos para reunir as chamadas dos grupos."
+                                >
+                                    <Button
+                                        title="Nova turma"
+                                        icon="add"
+                                        small
+                                        onPress={() => setTurmaModal(true)}
+                                    />
+                                </EmptyState>
                             )
                         }
                     />
+                ) : (
+                    <>
+                        {/* Barra de filtros: busca + período + local */}
+                        <View style={[styles.toolbar, isWide && styles.toolbarWide]}>
+                            <SearchBox
+                                value={query}
+                                onChangeText={setQuery}
+                                placeholder="Buscar por UBS, data ou turno"
+                                style={isWide ? { ...styles.toolbarSearch, flex: 1 } : styles.toolbarSearch}
+                            />
+
+                            {query.trim().length === 0 ? (
+                                <View style={styles.segmented} accessibilityRole="radiogroup">
+                                    {PERIODS.map((p) => {
+                                        const active = period === p.key;
+                                        return (
+                                            <Pressable
+                                                key={p.key}
+                                                accessibilityRole="radio"
+                                                accessibilityState={{ checked: active }}
+                                                onPress={() => setPeriod(p.key)}
+                                                style={[styles.segment, active && styles.segmentActive]}
+                                            >
+                                                <Text
+                                                    numberOfLines={1}
+                                                    style={[
+                                                        styles.segmentText,
+                                                        active && styles.segmentTextActive,
+                                                    ]}
+                                                >
+                                                    {p.label}
+                                                </Text>
+                                            </Pressable>
+                                        );
+                                    })}
+                                </View>
+                            ) : (
+                                <Text style={styles.resultCount}>
+                                    {filteredRollcalls.length}{" "}
+                                    {filteredRollcalls.length === 1 ? "resultado" : "resultados"} no histórico
+                                </Text>
+                            )}
+
+                            {ubsOptions.length > 1 && (
+                                <View style={[styles.localBox, !!ubsFilter && styles.localBoxActive]}>
+                                    <Ionicons
+                                        name="location-outline"
+                                        size={16}
+                                        color={ubsFilter ? colors.primary : colors.muted}
+                                    />
+                                    <Picker
+                                        selectedValue={ubsFilter}
+                                        onValueChange={(v) => setUbsFilter(String(v))}
+                                        accessibilityLabel="Filtrar por local"
+                                        style={styles.localPicker}
+                                    >
+                                        <Picker.Item label="Todos os locais" value="" />
+                                        {ubsOptions.map((o) => (
+                                            <Picker.Item key={o.key} label={o.name} value={o.key} />
+                                        ))}
+                                    </Picker>
+                                </View>
+                            )}
+                        </View>
+
+                        {loading ? (
+                            <View style={styles.skeletons}>
+                                {[0, 1, 2].map((i) => (
+                                    <View key={i} style={styles.skeletonCard}>
+                                        <Skeleton height={16} width="45%" />
+                                        <Skeleton height={12} width="65%" style={{ marginTop: spacing.sm }} />
+                                    </View>
+                                ))}
+                            </View>
+                        ) : (
+                            <FlatList
+                                data={daySections}
+                                keyExtractor={(s) => s.date}
+                                contentContainerStyle={styles.listContent}
+                                refreshControl={
+                                    <RefreshControl refreshing={refreshing} onRefresh={() => loadAll(true)} />
+                                }
+                                renderItem={({ item: day }) => (
+                                    <View style={styles.daySection}>
+                                        <View style={styles.dayHeader}>
+                                            <Text style={styles.dayTitle}>
+                                                {dayName(day.date)}
+                                                <Text style={styles.dayDate}>  {longDate(day.date)}</Text>
+                                            </Text>
+                                            <Text style={styles.dayTotals}>
+                                                {day.groups.length} {day.groups.length === 1 ? "local" : "locais"},{" "}
+                                                {day.students} aluno{day.students === 1 ? "" : "s"}
+                                            </Text>
+                                        </View>
+
+                                        <View style={styles.panel}>
+                                            {day.groups.map((group: any, index: number) => (
+                                                <Pressable
+                                                    key={group.key}
+                                                    accessibilityRole="button"
+                                                    accessibilityLabel={`Abrir chamadas de ${group.ubsName} em ${formatDateBR(group.date)}`}
+                                                    onPress={() =>
+                                                        group.items.length === 1
+                                                            ? router.push(`/coordinator/${group.items[0].id}`)
+                                                            : router.push({
+                                                                  pathname: "/coordinator/group",
+                                                                  params: {
+                                                                      ids: group.items
+                                                                          .map((i: any) => i.id)
+                                                                          .join(","),
+                                                                  },
+                                                              })
+                                                    }
+                                                    style={({ pressed }) => [
+                                                        styles.callRow,
+                                                        index > 0 && styles.callDivider,
+                                                        pressed && styles.callPressed,
+                                                    ]}
+                                                >
+                                                    <View
+                                                        style={[
+                                                            styles.turnoStrip,
+                                                            group.turno === "tarde"
+                                                                ? styles.turnoStripTarde
+                                                                : group.turno === "manha"
+                                                                  ? styles.turnoStripManha
+                                                                  : null,
+                                                        ]}
+                                                    />
+                                                    <View style={[styles.callMain, isWide && styles.callMainWide]}>
+                                                        <View style={styles.callPlace}>
+                                                            <Text style={styles.callTitle} numberOfLines={1}>
+                                                                {group.ubsName}
+                                                            </Text>
+                                                            {group.turno ? (
+                                                                <TurnoTag turno={group.turno} />
+                                                            ) : null}
+                                                        </View>
+                                                        <View style={styles.aulas}>
+                                                            {group.items.map((it: any) => (
+                                                                <View key={it.id} style={styles.aulaPill}>
+                                                                    <Text style={styles.aulaPillLabel}>
+                                                                        {shiftLabel(it.shift)}
+                                                                    </Text>
+                                                                    <Text style={styles.aulaPillValue}>
+                                                                        {(it.ras || []).length}
+                                                                    </Text>
+                                                                </View>
+                                                            ))}
+                                                        </View>
+                                                    </View>
+                                                    <Ionicons
+                                                        name="chevron-forward"
+                                                        size={18}
+                                                        color={colors.muted}
+                                                    />
+                                                </Pressable>
+                                            ))}
+                                        </View>
+                                    </View>
+                                )}
+                                ListEmptyComponent={
+                                    query.trim().length > 0 ? (
+                                        <EmptyState
+                                            icon="search-outline"
+                                            title="Nada encontrado"
+                                            description={`Nenhuma chamada corresponde a "${query.trim()}".`}
+                                        />
+                                    ) : period !== "all" ? (
+                                        <EmptyState
+                                            icon="today-outline"
+                                            title={
+                                                (period === "today"
+                                                    ? "Nenhuma chamada hoje"
+                                                    : "Nenhuma chamada nos últimos 7 dias") +
+                                                (ubsFilter ? " neste local" : "")
+                                            }
+                                            description="As chamadas aparecem aqui assim que os preceptores salvarem."
+                                        >
+                                            <Button
+                                                title="Ver todas as chamadas"
+                                                variant="secondary"
+                                                small
+                                                onPress={() => setPeriod("all")}
+                                            />
+                                        </EmptyState>
+                                    ) : (
+                                        <EmptyState
+                                            icon="clipboard-outline"
+                                            title="Nenhuma chamada recebida"
+                                            description="As chamadas salvas pelos preceptores aparecem aqui."
+                                        />
+                                    )
+                                }
+                            />
+                        )}
+                    </>
                 )}
+
+                {/* MODAL TURMA */}
+                <AppModal
+                    visible={turmaModal}
+                    onClose={() => setTurmaModal(false)}
+                    title="Nova turma"
+                    footer={
+                        <>
+                            <Button title="Fechar" variant="plain" onPress={() => setTurmaModal(false)} />
+                            <Button title="Salvar" loading={turmaSaving} onPress={handleCreateTurma} />
+                        </>
+                    }
+                >
+                    <Field
+                        label="Nome da turma"
+                        placeholder="Ex.: T1"
+                        value={turmaName}
+                        onChangeText={(v) => {
+                            setTurmaName(v);
+                            if (turmaError) setTurmaError(null);
+                        }}
+                        containerStyle={styles.fieldGap}
+                    />
+                    <Field
+                        label="Alunos (RA e nome)"
+                        placeholder={"Cole do Excel, um aluno por linha:\n12345;Maria da Silva\n12346;João Souza"}
+                        multiline
+                        value={turmaText}
+                        error={turmaError}
+                        onChangeText={(v) => {
+                            setTurmaText(v);
+                            if (turmaError) setTurmaError(null);
+                        }}
+                        style={styles.textArea}
+                    />
+                    <View style={styles.importRow}>
+                        {Platform.OS === "web" ? (
+                            <Button
+                                title="Importar arquivo CSV"
+                                icon="document-attach-outline"
+                                variant="secondary"
+                                small
+                                onPress={handlePickAlunosFile}
+                            />
+                        ) : null}
+                        {turmaText.trim() ? (
+                            <Text style={styles.importInfo}>
+                                {turmaPreview.alunos.length} aluno
+                                {turmaPreview.alunos.length === 1 ? "" : "s"} reconhecido
+                                {turmaPreview.alunos.length === 1 ? "" : "s"}
+                                {turmaPreview.ignored
+                                    ? ` · ${turmaPreview.ignored} linha${turmaPreview.ignored === 1 ? "" : "s"} sem RA ignorada${turmaPreview.ignored === 1 ? "" : "s"}`
+                                    : ""}
+                            </Text>
+                        ) : null}
+                    </View>
+                </AppModal>
 
                 {/* MODAL UBS */}
                 <AppModal
@@ -586,109 +979,361 @@ export function ManagementScreen({ title }: ManagementScreenProps) {
 
 const styles = StyleSheet.create({
     container: { flex: 1 },
-    containerWide: { maxWidth: 1000, alignSelf: "center", width: "100%" },
+    containerWide: { maxWidth: 1040, alignSelf: "center", width: "100%" },
 
-    actions: {
+    // Cabeçalho da página
+    pageHeader: {
         flexDirection: "row",
         flexWrap: "wrap",
+        alignItems: "flex-end",
+        justifyContent: "space-between",
         gap: spacing.sm,
-        marginBottom: spacing.xl,
+        marginTop: spacing.xs,
+        marginBottom: spacing.lg,
+        borderBottomWidth: 1,
+        borderBottomColor: colors.border,
     },
-
-    sectionTitle: {
-        ...type.sectionTitle,
-        marginBottom: spacing.md,
+    pageHeaderMain: {
+        gap: spacing.xs,
     },
-
-    search: {
-        marginBottom: spacing.md,
-    },
-    modalSearch: {
-        marginBottom: spacing.sm,
-    },
-
-    filterRow: {
-        flexDirection: "row",
-        flexWrap: "wrap",
-        gap: spacing.sm,
-        marginBottom: spacing.md,
-    },
-    chip: {
-        minHeight: 36,
-        justifyContent: "center",
-        paddingHorizontal: spacing.md,
-        borderRadius: radius.pill,
-        borderWidth: 1,
-        borderColor: colors.border,
-        backgroundColor: colors.surface,
-    },
-    chipActive: {
-        backgroundColor: colors.primary,
-        borderColor: colors.primary,
-    },
-    chipPressed: {
-        backgroundColor: colors.bg,
-    },
-    chipText: {
-        fontSize: 13,
-        fontWeight: "600",
-        color: colors.body,
-    },
-    chipTextActive: {
-        color: colors.white,
-    },
-    resultCount: {
+    todayText: {
         ...type.meta,
-        marginBottom: spacing.md,
+        fontSize: 14,
     },
-
-    listContent: {
-        gap: spacing.sm,
-        paddingBottom: spacing.xl,
+    tabs: {
+        flexDirection: "row",
+        gap: spacing.lg,
     },
-
-    card: {
+    tab: {
         flexDirection: "row",
         alignItems: "center",
+        gap: spacing.sm,
+        paddingTop: spacing.xs,
+        paddingBottom: spacing.sm + 2,
+        borderBottomWidth: 3,
+        borderBottomColor: "transparent",
+        marginBottom: -1,
+    },
+    tabActive: {
+        borderBottomColor: colors.primary,
+    },
+    tabPressed: {
+        opacity: 0.7,
+    },
+    tabText: {
+        fontSize: 22,
+        fontWeight: "700",
+        letterSpacing: -0.3,
+        color: colors.muted,
+    },
+    tabTextActive: {
+        color: colors.ink,
+    },
+    tabCount: {
+        fontSize: 13,
+        fontWeight: "700",
+        color: colors.muted,
+        backgroundColor: colors.divider,
+        borderRadius: radius.pill,
+        paddingHorizontal: 8,
+        paddingVertical: 1,
+        overflow: "hidden",
+    },
+    tabCountActive: {
+        color: colors.primary,
+        backgroundColor: colors.primaryTint,
+    },
+    topActions: {
+        flexDirection: "row",
+        alignItems: "center",
+        paddingBottom: spacing.sm,
+    },
+
+    // Barra de filtros
+    toolbar: {
+        gap: spacing.sm,
+        padding: spacing.sm,
+        marginBottom: spacing.xl,
         backgroundColor: colors.surface,
         borderWidth: 1,
         borderColor: colors.border,
         borderRadius: radius.md,
-        paddingVertical: spacing.md,
-        paddingHorizontal: spacing.lg,
-        gap: spacing.md,
         ...shadow,
     },
-    cardPressed: {
+    toolbarWide: {
+        flexDirection: "row",
+        alignItems: "center",
+    },
+    toolbarSearch: {
+        borderWidth: 0,
+        backgroundColor: colors.bg,
+        minHeight: 40,
+    },
+    segmented: {
+        flexDirection: "row",
+        flexShrink: 0,
+        padding: 3,
+        borderRadius: radius.sm + 2,
         backgroundColor: colors.bg,
     },
-    cardBody: { flex: 1 },
-    turnoTag: {
-        marginBottom: spacing.xs + 2,
+    segment: {
+        flexGrow: 1,
+        minHeight: 34,
+        paddingHorizontal: spacing.md,
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: radius.sm,
     },
-    cardTitle: {
-        ...type.itemTitle,
+    segmentActive: {
+        backgroundColor: colors.surface,
+        ...(Platform.OS === "web"
+            ? ({ boxShadow: "0 1px 2px rgba(15, 23, 42, 0.12)" } as object)
+            : { elevation: 1 }),
     },
-    cardMetaRow: {
+    segmentText: {
+        fontSize: 13,
+        fontWeight: "600",
+        color: colors.muted,
+    },
+    segmentTextActive: {
+        color: colors.ink,
+    },
+    resultCount: {
+        ...type.meta,
+        paddingHorizontal: spacing.sm,
+    },
+    localBox: {
         flexDirection: "row",
         alignItems: "center",
         gap: spacing.xs,
-        marginTop: spacing.xs,
+        minHeight: 40,
+        minWidth: 220,
+        paddingLeft: spacing.md,
+        borderRadius: radius.sm + 2,
+        backgroundColor: colors.bg,
+        overflow: "hidden",
     },
-    cardMeta: {
-        ...type.meta,
-    },
-    badge: {
+    localBoxActive: {
         backgroundColor: colors.primaryTint,
-        borderRadius: radius.pill,
-        paddingHorizontal: spacing.sm,
-        paddingVertical: 2,
-        marginLeft: spacing.xs,
     },
-    badgeText: {
+    localPicker: {
+        flex: 1,
+        minHeight: 40,
+        borderWidth: 0,
+        backgroundColor: "transparent",
+        color: colors.ink,
+        fontSize: 13,
+        fontWeight: "600",
+        paddingRight: spacing.sm,
+        ...(Platform.OS === "web" ? ({ outlineStyle: "none", cursor: "pointer" } as object) : null),
+    },
+
+    listContent: {
+        paddingBottom: spacing.xxl,
+    },
+
+    // Livro de chamadas: um bloco por dia
+    daySection: {
+        marginBottom: spacing.xl,
+    },
+    dayHeader: {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        alignItems: "baseline",
+        justifyContent: "space-between",
+        gap: spacing.sm,
+        marginBottom: spacing.sm,
+        paddingHorizontal: spacing.xs,
+    },
+    dayTitle: {
+        fontSize: 16,
+        fontWeight: "700",
+        color: colors.ink,
+    },
+    dayDate: {
+        fontSize: 14,
+        fontWeight: "400",
+        color: colors.muted,
+    },
+    dayTotals: {
+        ...type.meta,
+        fontVariant: ["tabular-nums"],
+    },
+    panel: {
+        backgroundColor: colors.surface,
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: radius.md,
+        overflow: "hidden",
+        ...shadow,
+    },
+    callRow: {
+        flexDirection: "row",
+        alignItems: "center",
+        gap: spacing.md,
+        minHeight: 64,
+        paddingVertical: spacing.md,
+        paddingLeft: spacing.lg + 4,
+        paddingRight: spacing.md,
+        backgroundColor: colors.surface,
+    },
+    callDivider: {
+        borderTopWidth: 1,
+        borderTopColor: colors.divider,
+    },
+    callPressed: {
+        backgroundColor: colors.bg,
+    },
+    // Faixa do turno na borda esquerda: identifica manhã/tarde de relance
+    turnoStrip: {
+        position: "absolute",
+        left: 0,
+        top: 0,
+        bottom: 0,
+        width: 4,
+        backgroundColor: colors.border,
+    },
+    turnoStripManha: {
+        backgroundColor: "#8FB3D1",
+    },
+    turnoStripTarde: {
+        backgroundColor: colors.primary,
+    },
+    callMain: {
+        flex: 1,
+        gap: spacing.sm,
+    },
+    callMainWide: {
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "space-between",
+    },
+    callPlace: {
+        flexShrink: 1,
+        flexDirection: "row",
+        flexWrap: "wrap",
+        alignItems: "center",
+        gap: spacing.sm,
+    },
+    callTitle: {
+        ...type.itemTitle,
+        flexShrink: 1,
+    },
+    aulas: {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        gap: spacing.sm,
+    },
+    aulaPill: {
+        flexDirection: "row",
+        alignItems: "center",
+        borderRadius: radius.sm,
+        borderWidth: 1,
+        borderColor: colors.border,
+        overflow: "hidden",
+    },
+    aulaPillLabel: {
         fontSize: 12,
         fontWeight: "600",
+        color: colors.muted,
+        paddingHorizontal: spacing.sm,
+        paddingVertical: 3,
+    },
+    aulaPillValue: {
+        minWidth: 28,
+        textAlign: "center",
+        fontSize: 13,
+        fontWeight: "700",
         color: colors.primary,
+        backgroundColor: colors.primaryTint,
+        paddingHorizontal: spacing.sm,
+        paddingVertical: 3,
+        fontVariant: ["tabular-nums"],
+    },
+
+    // Turmas
+    turmasIntro: {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: spacing.md,
+        marginBottom: spacing.lg,
+    },
+    hint: {
+        ...type.body,
+        fontSize: 14,
+        color: colors.muted,
+        flex: 1,
+        minWidth: 240,
+        maxWidth: 620,
+    },
+    turmaGridRow: {
+        gap: spacing.md,
+    },
+    turmaCard: {
+        backgroundColor: colors.surface,
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: radius.md,
+        padding: spacing.lg,
+        marginBottom: spacing.md,
+        ...shadow,
+    },
+    turmaCardWide: {
+        flex: 1,
+        maxWidth: "33.333%",
+    },
+    turmaTop: {
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "space-between",
+    },
+    turmaName: {
+        fontSize: 26,
+        fontWeight: "800",
+        letterSpacing: -0.5,
+        color: colors.primary,
+        flexShrink: 1,
+    },
+    turmaStudents: {
+        ...type.meta,
+        fontSize: 14,
+        marginTop: 2,
+    },
+    turmaLast: {
+        marginTop: spacing.lg,
+        gap: spacing.xs + 2,
+    },
+    turmaLastRow: {
+        flexDirection: "row",
+        justifyContent: "space-between",
+        alignItems: "baseline",
+    },
+    turmaLastLabel: {
+        ...type.meta,
+    },
+    turmaLastValue: {
+        fontSize: 14,
+        fontWeight: "700",
+        color: colors.ink,
+        fontVariant: ["tabular-nums"],
+    },
+    progressTrack: {
+        height: 6,
+        borderRadius: radius.pill,
+        backgroundColor: colors.divider,
+        overflow: "hidden",
+    },
+    progressFill: {
+        height: "100%",
+        borderRadius: radius.pill,
+        backgroundColor: colors.success,
+    },
+    turmaNone: {
+        ...type.meta,
+        marginTop: spacing.lg,
+        fontStyle: "italic",
     },
 
     skeletons: { gap: spacing.sm },
@@ -700,6 +1345,24 @@ const styles = StyleSheet.create({
         padding: spacing.lg,
     },
 
+    // Modais
+    textArea: {
+        minHeight: 140,
+        textAlignVertical: "top",
+    },
+    importRow: {
+        flexDirection: "row",
+        flexWrap: "wrap",
+        alignItems: "center",
+        gap: spacing.sm,
+        marginTop: spacing.sm,
+    },
+    importInfo: {
+        ...type.meta,
+    },
+    modalSearch: {
+        marginBottom: spacing.sm,
+    },
     modalSubtitle: {
         ...type.label,
         marginTop: spacing.xl,
