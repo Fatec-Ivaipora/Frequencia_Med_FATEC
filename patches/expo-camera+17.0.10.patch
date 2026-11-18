@@ -1,0 +1,13 @@
+diff --git a/node_modules/expo-camera/build/web/useWebQRScanner.js b/node_modules/expo-camera/build/web/useWebQRScanner.js
+index ae13c40..88f6ece 100644
+--- a/node_modules/expo-camera/build/web/useWebQRScanner.js
++++ b/node_modules/expo-camera/build/web/useWebQRScanner.js
+@@ -60,7 +60,7 @@ const createWorkerAsyncFunction = (fn, deps) => {
+     };
+ };
+ const decode = createWorkerAsyncFunction(qrWorkerMethod, [
+-    'https://cdn.jsdelivr.net/npm/jsqr@1.2.0/dist/jsQR.min.js',
++    typeof location !== 'undefined' ? new URL('/jsQR.min.js', location.origin).toString() : '/jsQR.min.js',
+ ]);
+ export function useWebQRScanner(video, { isEnabled, captureOptions, interval, onScanned, onError, }) {
+     const isRunning = React.useRef(false);
